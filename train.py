@@ -1,5 +1,6 @@
 import os
 import glob
+import re
 import pandas as pd
 import numpy as np
 import torch
@@ -15,15 +16,13 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from tqdm import tqdm
 from datetime import datetime
 
-# Konfiguration
+# ─── Konfiguration ─────────────────────────────────────────────────────────────
 class Config:
-    # Dateipfade
     csv_path = "labels.csv"
     image_dir = "anime"
     checkpoint_dir = "checkpoints"
     samples_dir = "training_samples"
     
-    # Modellparameter
     pretrained_model_name = "openai/clip-vit-large-patch14"
     image_size = 256
     batch_size = 1
@@ -33,17 +32,15 @@ class Config:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     samples_per_epoch = 5000
 
-    # Diffusion Parameter
     num_train_timesteps = 500
     beta_start = 0.0001
     beta_end = 0.02
 
-    # Sampling Parameter
     num_samples = 1
     sample_steps = 50
     sample_seed = 42
 
-# CUDA Initialisierung
+# ─── CUDA Setup ────────────────────────────────────────────────────────────────
 def setup_cuda():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -52,7 +49,7 @@ def setup_cuda():
     else:
         print("CUDA nicht verfügbar - Verwende CPU")
 
-# Dataset Klasse
+# ─── Dataset ───────────────────────────────────────────────────────────────────
 class TextImageDataset(Dataset):
     def __init__(self, csv_path, image_dir, transform=None):
         self.df = pd.read_csv(csv_path)
@@ -78,11 +75,9 @@ class TextImageDataset(Dataset):
             image = self.transform(image)
             
         text_input = self.tokenizer(
-            text, 
-            padding="max_length", 
-            max_length=self.tokenizer.model_max_length, 
-            truncation=True, 
-            return_tensors="pt"
+            text, padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            truncation=True, return_tensors="pt"
         )
         
         return {
@@ -113,15 +108,14 @@ def prepare_data():
         pin_memory=True
     )
 
+# ─── Model Initialization ─────────────────────────────────────────────────────
 def initialize_models():
     text_encoder = CLIPTextModel.from_pretrained(Config.pretrained_model_name)
     tokenizer = CLIPTokenizer.from_pretrained(Config.pretrained_model_name)
     
     unet = UNet2DConditionModel(
         sample_size=Config.image_size // 8,
-        in_channels=3,
-        out_channels=3,
-        layers_per_block=2,
+        in_channels=3, out_channels=3, layers_per_block=2,
         block_out_channels=(128, 256, 512, 512),
         down_block_types=(
             "DownBlock2D",
@@ -147,165 +141,156 @@ def initialize_models():
     
     return text_encoder, unet, noise_scheduler, tokenizer
 
+# ─── Checkpoint Handling ───────────────────────────────────────────────────────
 def find_latest_checkpoint():
     os.makedirs(Config.checkpoint_dir, exist_ok=True)
-    checkpoints = glob.glob(os.path.join(Config.checkpoint_dir, "checkpoint_epoch_*.pt"))
-    if not checkpoints:
+    files = [f for f in os.listdir(Config.checkpoint_dir)
+             if f.startswith("checkpoint_epoch_") and f.endswith(".pt")]
+    if not files:
         return None
-    checkpoints.sort(key=lambda x: int(x.split('_')[-2]))
-    return checkpoints[-1]
+
+    # Liste von (epoch:int, timestamp:datetime, filename)
+    ckpts = []
+    for fn in files:
+        parts = fn.split('_')
+        # parts = ['checkpoint','epoch','{E}','YYYYMMDD','HHMMSS.pt']
+        epoch = int(parts[2])
+        ts_str = parts[3] + "_" + parts[4].replace(".pt","")
+        ts = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+        ckpts.append( (epoch, ts, fn) )
+
+    # Finde höchsten Epoch-Wert
+    max_epoch = max(c[0] for c in ckpts)
+    # Filter nur die mit max_epoch, und wähle den mit spätestem Timestamp
+    latest = max((c for c in ckpts if c[0]==max_epoch), key=lambda x: x[1])
+    return os.path.join(Config.checkpoint_dir, latest[2])
+
+def extract_epoch_from_filename(path):
+    fn = os.path.basename(path)
+    match = re.search(r'checkpoint_epoch_(\d+)_', fn)
+    return int(match.group(1)) if match else 0
 
 def save_checkpoint(epoch, unet, optimizer, loss):
     os.makedirs(Config.checkpoint_dir, exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    checkpoint_path = os.path.join(
-        Config.checkpoint_dir, 
-        f"checkpoint_epoch_{epoch+1}_{timestamp}.pt"
+    path = os.path.join(
+        Config.checkpoint_dir,
+        f"checkpoint_epoch_{epoch}_{timestamp}.pt"
     )
     torch.save({
         'epoch': epoch,
         'unet_state_dict': {k: v.cpu() for k, v in unet.state_dict().items()},
         'optimizer_state_dict': optimizer.state_dict(),
         'loss': loss,
-    }, checkpoint_path)
-    print(f"\nCheckpoint gespeichert: {checkpoint_path}")
-    return checkpoint_path
+    }, path)
+    print(f"\nCheckpoint gespeichert: {path}")
+    return path
 
+# ─── Sample Generation ────────────────────────────────────────────────────────
 def generate_samples(epoch, unet, text_encoder, tokenizer, device):
     os.makedirs(Config.samples_dir, exist_ok=True)
-    unet.eval()
-    text_encoder.eval()
+    unet.eval(); text_encoder.eval()
     
-    sample_texts = [
+    prompts = [
         "a girl with purple hairs",
         "a girl with purple hair",
         "a girl with blue hairs",
         "a woman with purple hairs and a black shirt"
     ]
-    
-    ddim_scheduler = DDIMScheduler(
+    ddim = DDIMScheduler(
         num_train_timesteps=Config.num_train_timesteps,
         beta_start=Config.beta_start,
         beta_end=Config.beta_end,
         beta_schedule="linear"
     )
-    
     torch.manual_seed(Config.sample_seed)
     
     with torch.no_grad():
-        for i, prompt in enumerate(sample_texts[:Config.num_samples]):
-            text_input = tokenizer(
-                prompt,
-                padding="max_length",
-                max_length=tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt"
-            ).to(device)
+        for i, p in enumerate(prompts[:Config.num_samples]):
+            ti = tokenizer(p, padding="max_length",
+                           max_length=tokenizer.model_max_length,
+                           truncation=True, return_tensors="pt").to(device)
+            emb = text_encoder(ti.input_ids)[0]
+            noise = torch.randn((1,3,Config.image_size,Config.image_size), device=device)
+            ddim.set_timesteps(Config.sample_steps)
+            for t in ddim.timesteps:
+                pred = unet(noise, t, encoder_hidden_states=emb).sample
+                noise = ddim.step(pred, t, noise).prev_sample
             
-            text_embeddings = text_encoder(text_input.input_ids)[0]
-            noise = torch.randn((1, 3, Config.image_size, Config.image_size), device=device)
-            ddim_scheduler.set_timesteps(Config.sample_steps)
-            
-            for t in ddim_scheduler.timesteps:
-                noise_pred = unet(
-                    noise,
-                    t,
-                    encoder_hidden_states=text_embeddings
-                ).sample
-                noise = ddim_scheduler.step(noise_pred, t, noise).prev_sample
-            
-            sample_path = os.path.join(
+            out = (noise + 1) / 2
+            save_image(out, os.path.join(
                 Config.samples_dir,
-                f"sample_epoch_{epoch+1}_{i}_{prompt[:20].replace(' ', '_')}.png"
-            )
-            save_image((noise + 1) / 2, sample_path)
-            print(f"Sample gespeichert: {sample_path}")
-    
-    unet.train()
-    text_encoder.train()
+                f"sample_epoch_{epoch}_{i}.png"
+            ))
+    unet.train(); text_encoder.train()
 
-def load_checkpoint(checkpoint_path, device):
+def load_checkpoint(path, device):
     try:
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        # Tensoren verschieben wir im train(), deshalb hier nur Rückgabe
-        return checkpoint
+        return torch.load(path, map_location='cpu')
     except Exception as e:
         print(f"Fehler beim Laden des Checkpoints: {e}")
         return None
 
+# ─── Training Loop ────────────────────────────────────────────────────────────
 def train():
     setup_cuda()
     device = torch.device(Config.device)
-    
-    # Modelle initialisieren
-    text_encoder, unet, noise_scheduler, tokenizer = initialize_models()
-    
-    # Modelle auf Device verschieben
-    text_encoder = text_encoder.to(device)
-    unet = unet.to(device)
-    text_encoder.train()
-    unet.train()
 
-    # Optimizer initialisieren (erst nachdem Unet auf GPU ist)
+    text_encoder, unet, noise_scheduler, tokenizer = initialize_models()
+    text_encoder = text_encoder.to(device); unet = unet.to(device)
+    text_encoder.train(); unet.train()
+
     optimizer = optim.AdamW(unet.parameters(), lr=Config.learning_rate)
-    
-    # Checkpoint laden falls vorhanden
-    start_epoch = 0
+
+    # Checkpoint laden
     latest_ckpt = find_latest_checkpoint()
     if latest_ckpt:
         print(f"Versuche letzten Checkpoint zu laden: {latest_ckpt}")
         ckpt = load_checkpoint(latest_ckpt, device)
         if ckpt:
             unet.load_state_dict(ckpt['unet_state_dict'])
-            start_epoch = ckpt['epoch'] + 1
-            print(f"Checkpoint erfolgreich geladen, starte mit Epoche {start_epoch}")
-            if 'optimizer_state_dict' in ckpt:
-                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            start_epoch = extract_epoch_from_filename(latest_ckpt)
+            print(f"Checkpoint geladen, starte mit Epoche {start_epoch}")
         else:
-            print("Checkpoint konnte nicht geladen werden, starte von vorne")
-    
-    # Trainingsloop
+            print("Konnte Checkpoint nicht laden, starte bei Epoche 0")
+            start_epoch = 0
+    else:
+        print("Kein Checkpoint gefunden, starte bei Epoche 0")
+        start_epoch = 0
+
+    # Haupt-Loop
     for epoch in range(start_epoch, Config.num_epochs):
         dataloader = prepare_data()
         epoch_loss = 0
-        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{Config.num_epochs}")
-        
-        for batch in progress_bar:
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{Config.num_epochs}")
+        for batch in pbar:
             optimizer.zero_grad()
-            pixel_values = batch["pixel_values"].to(device, non_blocking=True)
-            input_ids = batch["input_ids"].to(device, non_blocking=True)
-            
+            pv = batch["pixel_values"].to(device, non_blocking=True)
+            ids = batch["input_ids"].to(device, non_blocking=True)
             with torch.no_grad():
-                encoder_hidden_states = text_encoder(input_ids)[0]
-            
-            noise = torch.randn_like(pixel_values)
-            timesteps = torch.randint(
-                0, noise_scheduler.num_train_timesteps,
-                (pixel_values.shape[0],),
-                device=device
-            ).long()
-            
-            noisy_images = noise_scheduler.add_noise(pixel_values, noise, timesteps)
-            noise_pred = unet(noisy_images, timesteps, encoder_hidden_states).sample
-            loss = nn.functional.mse_loss(noise_pred, noise)
-            
-            loss.backward()
-            optimizer.step()
-            
+                emb = text_encoder(ids)[0]
+            noise = torch.randn_like(pv)
+            ts = torch.randint(0, noise_scheduler.config.num_train_timesteps,
+                               (pv.shape[0],), device=device).long()
+            noisy = noise_scheduler.add_noise(pv, noise, ts)
+            pred = unet(noisy, ts, encoder_hidden_states=emb).sample
+            loss = nn.functional.mse_loss(pred, noise)
+            loss.backward(); optimizer.step()
             epoch_loss += loss.item()
-            progress_bar.set_postfix(loss=loss.item())
-        
-        avg_loss = epoch_loss / len(dataloader)
-        save_checkpoint(epoch, unet, optimizer, avg_loss)
-        generate_samples(epoch, unet, text_encoder, tokenizer, device)
-    
+            pbar.set_postfix(loss=loss.item())
+
+        avg = epoch_loss / len(dataloader)
+        save_checkpoint(epoch + 1, unet, optimizer, avg)
+        generate_samples(epoch + 1, unet, text_encoder, tokenizer, device)
+
     # Finale Speicherung
-    final_model_path = "text_to_image_unet_final.pth"
-    torch.save(unet.state_dict(), final_model_path)
+    torch.save(unet.state_dict(), "text_to_image_unet_final.pth")
     text_encoder.save_pretrained("text_encoder")
     tokenizer.save_pretrained("tokenizer")
-    print(f"\nTraining abgeschlossen. Finales Modell gespeichert unter {final_model_path}")
+    print("\nTraining abgeschlossen!")
 
 if __name__ == "__main__":
     train()
+
 
