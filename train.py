@@ -40,7 +40,7 @@ class Config:
 
         self.num_samples = int(input("Anzahl generierter Samples (z.B. 1): ") or 1)
         self.sample_steps = int(input("Sampling Steps (z.B. 100): ") or 100)
-        self.sample_seed = int(input("Sample Seed (z.B. 425): ") or 425)
+        self.sample_seed = int(input("Sample Seed (z.B. 42): ") or 42)
 
 # ─── CUDA Setup ────────────────────────────────────────────────────────────────
 def setup_cuda(config):
